@@ -2,17 +2,19 @@ import asyncio
 import functools
 import os
 import signal
-from collections import defaultdict
+import traceback
 from io import BytesIO
-from inspect import isawaitable
 
 from httptools import HttpRequestParser, HttpParserError, parse_url
 import uvloop
 
 from .log import log
+from .wsgi_response import HttpResponse
+
+DEFAULT_ENCODING = 'ISO-8859-1'
 
 
-def bytes_to_native(byte_string, encoding='ISO-8859-1'):
+def bytes_to_native(byte_string, encoding=DEFAULT_ENCODING):
     return byte_string.decode(encoding)
 
 
@@ -22,6 +24,7 @@ class ServerDefaults:
     SERVER_PROTOCOL = 'HTTP/1.1'
     MAX_REQUEST_SIZE = 100000
     URL_SCHEME = 'http'
+    TIMEOUT = 60
 
 
 class WSGIFields:
@@ -50,7 +53,8 @@ class WSGIHttpProtocol(asyncio.Protocol):
     def __init__(
             self, loop, application, base_env,
             max_request_size=ServerDefaults.MAX_REQUEST_SIZE,
-            port=ServerDefaults.PORT):
+            response_type=HttpResponse, port=ServerDefaults.PORT,
+            timeout=ServerDefaults.TIMEOUT):
         self.loop = loop
         self.application = application
         self.base_env = base_env
@@ -59,7 +63,11 @@ class WSGIHttpProtocol(asyncio.Protocol):
         self.current_request_size = 0
         self.max_request_size = max_request_size
         self.parser = None
+        self.timeout = timeout
         self.env = self.fresh_env()
+        # Empty response object at first
+        self.response = None
+        self.response_type = response_type
 
     @classmethod
     def register_connection(cls, connection):
@@ -135,16 +143,67 @@ class WSGIHttpProtocol(asyncio.Protocol):
             self.env[WSGIFields.INPUT] = BytesIO(body)
 
     def on_message_complete(self):
-        # TODO: Add things to write out response for WSGI
-        self.transport.write()
+        log.debug('MESSAGE COMPLETE ATTEMPTING TO WRITE')
+        self.env[WSGIFields.ERROR_STREAM] = BytesIO()
+        try:
+            body = self.application(self.env, self.start_response)
+            try:
+                body.decode
+            except AttributeError:
+                body = body.encode(DEFAULT_ENCODING)
+            self.transport.write(
+                self.response.to_html(
+                    body,
+                    self.server_protocol,
+                    self.parser.should_keep_alive() and not self.signal.stopped,
+                    self.timeout
+                )
+            )
+        except:
+            log.debug(traceback.format_exception())
+        self.transport.flush()
         self.transport.close()
 
+        # TODO: Add things to write out response for WSGI
+        # self.transport.write()
+        # self.transport.close()
+
+    def start_response(self, status, headers, exc_info=None):
+        try:
+            self.response = HttpResponse(status.encode(DEFAULT_ENCODING))
+        except AttributeError:
+            raise TypeError('Status must be of type str')
+        for key, value in headers:
+            try:
+                encoded_key = key.encode(DEFAULT_ENCODING)
+                encoded_value = value.encode(DEFAULT_ENCODING)
+            except AttributeError:
+                # Handle places where the the key, value isn't a str
+                key, value = str(key), str(value)
+                encoded_key = key.encode(DEFAULT_ENCODING)
+                encoded_value = value.encode(DEFAULT_ENCODING)
+            except:
+                # TODO: Add unexpected error handling here
+                pass
+            self.response.headers.append((encoded_key, encoded_value))
+            if key.casefold() == 'content-length':
+                self.response.content_length = int(value)
+            elif key.casefold() == 'content-type':
+                self.response.content = encoded_value
+        return self.write
+
+    def write(self, chunk):
+        if self.response is None:
+            # TODO: Replace with custom exception
+            raise Exception('WSGI write called before start_response')
+        pass
 
 
 def serve(
+        application,
         host=ServerDefaults.HOST, port=ServerDefaults.PORT,
         url_scheme=ServerDefaults.URL_SCHEME,
-        server_protocol=ServerDefaults.SERVER_PROTOCOL,):
+        server_protocol=ServerDefaults.SERVER_PROTOCOL):
     loop = uvloop.new_event_loop()
     asyncio.set_event_loop(loop)
 
