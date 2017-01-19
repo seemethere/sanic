@@ -151,18 +151,21 @@ class WSGIHttpProtocol(asyncio.Protocol):
                 body.decode
             except AttributeError:
                 body = body.encode(DEFAULT_ENCODING)
+            log.debug('GETTING TO WRITE TO THE SERVER!')
             self.transport.write(
                 self.response.to_html(
                     body,
                     self.server_protocol,
-                    self.parser.should_keep_alive() and not self.signal.stopped,
+                    (self.parser.should_keep_alive() and not self.signal.stopped),
                     self.timeout
                 )
             )
+            log.debug('WROTE TO THE SERVER!')
         except:
             log.debug(traceback.format_exception())
-        self.transport.flush()
-        self.transport.close()
+        finally:
+            self.transport.flush()
+            self.transport.close()
 
         # TODO: Add things to write out response for WSGI
         # self.transport.write()
