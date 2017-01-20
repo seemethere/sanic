@@ -10,6 +10,7 @@ import uvloop
 
 from .log import log
 from .wsgi_response import HttpResponse
+from .exceptions import ServerError
 
 DEFAULT_ENCODING = 'ISO-8859-1'
 
@@ -68,6 +69,7 @@ class WSGIHttpProtocol(asyncio.Protocol):
         # Empty response object at first
         self.response = None
         self.response_type = response_type
+        self.bytes_remaining = None
 
     @classmethod
     def register_connection(cls, connection):
@@ -146,7 +148,7 @@ class WSGIHttpProtocol(asyncio.Protocol):
         log.debug('MESSAGE COMPLETE ATTEMPTING TO WRITE')
         self.env[WSGIFields.ERROR_STREAM] = BytesIO()
         try:
-            body = self.application(self.env, self.start_response)
+            application_response = self.application(self.env, self.start_response)
             try:
                 body.decode
             except AttributeError:
@@ -156,7 +158,8 @@ class WSGIHttpProtocol(asyncio.Protocol):
                 self.response.to_html(
                     body,
                     self.server_protocol,
-                    (self.parser.should_keep_alive() and not self.signal.stopped),
+                    (self.parser.should_keep_alive()
+                     and not self.signal.stopped),
                     self.timeout
                 )
             )
@@ -190,7 +193,9 @@ class WSGIHttpProtocol(asyncio.Protocol):
                 pass
             self.response.headers.append((encoded_key, encoded_value))
             if key.casefold() == 'content-length':
-                self.response.content_length = int(value)
+                val = int(value)
+                self.response.content_length = val
+                self.bytes_remaining = val
             elif key.casefold() == 'content-type':
                 self.response.content = encoded_value
         return self.write
@@ -198,8 +203,24 @@ class WSGIHttpProtocol(asyncio.Protocol):
     def write(self, chunk):
         if self.response is None:
             # TODO: Replace with custom exception
-            raise Exception('WSGI write called before start_response')
-        pass
+            raise ServerError('WSGI write called before start_response')
+        if not self.headers_sent:
+            self.headers_sent = True
+            self.transport.write(self.response.header_bytes)
+
+        chunk_length = len(chunk)
+        if (self.bytes_remaining is not None and
+                chunk_length > self.bytes_remaining):
+            raise ServerError(
+                'Application wanted more bytes than allocated for')
+
+        self.transport.write(chunk)
+
+        if self.bytes_remaining is not None:
+            self.bytes_remaining -= chunk_length
+            if self.bytes_remaining < 0:
+                raise ServerError(
+                    'Response body exceeds decalred Content-Length')
 
 
 def serve(
