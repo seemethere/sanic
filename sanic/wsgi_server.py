@@ -2,6 +2,7 @@ import asyncio
 import functools
 import os
 import signal
+import sys
 import traceback
 from io import BytesIO
 
@@ -10,7 +11,6 @@ import uvloop
 
 from .log import log
 from .wsgi_response import HttpResponse
-from .exceptions import ServerError
 
 DEFAULT_ENCODING = 'ISO-8859-1'
 
@@ -42,13 +42,14 @@ class WSGIFields:
     VERSION = 'wsgi.version'
     URL_SCHEME = 'wsgi.url_scheme'
     INPUT = 'wsgi.input'
-    ERROR_STREAM = 'wsgi.errors'
+    ERROR = 'wsgi.errors'
     MULTITHREAD = 'wsgi.multithread'
     MULTIPROCESS = 'wsgi.multiprocess'
     RUN_ONCE = 'wsgi.run_once'
 
 
 class WSGIHttpProtocol(asyncio.Protocol):
+    server_protocol_bytes = b''
     connections = set()
 
     def __init__(
@@ -90,18 +91,18 @@ class WSGIHttpProtocol(asyncio.Protocol):
 
     # Connections
     def connection_made(self, transport):
-        log.debug('Connection Made!')
+        # log.debug('Connection Made!')
         self.transport = transport
         self.register_connection(self)
 
     def connection_lost(self, exc):
-        self.transport = None
+        self.transport.close()
         self.deregister_connection(self)
 
     # Data
     def data_received(self, data):
-        log.debug('Data recieved!')
         self.current_request_size += len(data)
+        self.env[WSGIFields.INPUT] = BytesIO()
         if self.current_request_size > self.max_request_size:
             # TODO: Write error handling for payload too large
             pass
@@ -116,12 +117,14 @@ class WSGIHttpProtocol(asyncio.Protocol):
             # TODO: Handle error
 
     def on_url(self, url):
-        parsed_url = parse_url(url)
-        self.env[WSGIFields.PATH_INFO] = parsed_url.path
-        self.env[WSGIFields.QUERY_STRING] = parsed_url.query or ''
+        try:
+            parsed_url = parse_url(url)
+            self.env[WSGIFields.PATH_INFO] = parsed_url.path.decode('latin1')
+            self.env[WSGIFields.QUERY_STRING] = parsed_url.query or ''
+        except:
+            log.error(traceback.format_exc())
 
     def on_header(self, name, value):
-        log.info(f'Got a header {name}: {value}')
         translated_name = bytes_to_native(name).upper().replace("-", "_")
         if name == b'Content-Length' and int(value) > self.max_request_size:
             ...
@@ -132,51 +135,19 @@ class WSGIHttpProtocol(asyncio.Protocol):
             self.env['HTTP_' + translated_name] = bytes_to_native(value)
 
     def on_headers_complete(self):
-        log.info(f'HEADERS FINISHED')
         remote_addr = self.transport.get_extra_info('peername')
         if remote_addr:
             self.env['HTTP_REMOTE_ADDR'] = '%s:%s' % remote_addr
 
     def on_body(self, body):
-        log.info(f'GOT A BODY: {body}')
-        try:
-            self.env[WSGIFields.INPUT].write(body)
-        except KeyError:
-            self.env[WSGIFields.INPUT] = BytesIO(body)
-
-    def on_message_complete(self):
-        log.debug('MESSAGE COMPLETE ATTEMPTING TO WRITE')
-        self.env[WSGIFields.ERROR_STREAM] = BytesIO()
-        try:
-            application_response = self.application(self.env, self.start_response)
-            try:
-                body.decode
-            except AttributeError:
-                body = body.encode(DEFAULT_ENCODING)
-            log.debug('GETTING TO WRITE TO THE SERVER!')
-            self.transport.write(
-                self.response.to_html(
-                    body,
-                    self.server_protocol,
-                    (self.parser.should_keep_alive()
-                     and not self.signal.stopped),
-                    self.timeout
-                )
-            )
-            log.debug('WROTE TO THE SERVER!')
-        except:
-            log.debug(traceback.format_exception())
-        finally:
-            self.transport.flush()
-            self.transport.close()
-
-        # TODO: Add things to write out response for WSGI
-        # self.transport.write()
-        # self.transport.close()
+        self.env[WSGIFields.INPUT].write(body)
 
     def start_response(self, status, headers, exc_info=None):
         try:
-            self.response = HttpResponse(status.encode(DEFAULT_ENCODING))
+            self.response = HttpResponse(
+                status.encode(DEFAULT_ENCODING),
+                self.env[WSGIFields.SERVER_PROTOCOL].encode(DEFAULT_ENCODING),
+                self.transport)
         except AttributeError:
             raise TypeError('Status must be of type str')
         for key, value in headers:
@@ -193,34 +164,20 @@ class WSGIHttpProtocol(asyncio.Protocol):
                 pass
             self.response.headers.append((encoded_key, encoded_value))
             if key.casefold() == 'content-length':
-                val = int(value)
-                self.response.content_length = val
-                self.bytes_remaining = val
-            elif key.casefold() == 'content-type':
-                self.response.content = encoded_value
-        return self.write
+                self.response.set_content_length(int(value))
+        return self.response.write
 
-    def write(self, chunk):
-        if self.response is None:
-            # TODO: Replace with custom exception
-            raise ServerError('WSGI write called before start_response')
-        if not self.headers_sent:
-            self.headers_sent = True
-            self.transport.write(self.response.header_bytes)
-
-        chunk_length = len(chunk)
-        if (self.bytes_remaining is not None and
-                chunk_length > self.bytes_remaining):
-            raise ServerError(
-                'Application wanted more bytes than allocated for')
-
-        self.transport.write(chunk)
-
-        if self.bytes_remaining is not None:
-            self.bytes_remaining -= chunk_length
-            if self.bytes_remaining < 0:
-                raise ServerError(
-                    'Response body exceeds decalred Content-Length')
+    def on_message_complete(self):
+        self.env[WSGIFields.ERROR] = sys.stderr
+        self.env[WSGIFields.REQUEST_METHOD] = bytes_to_native(
+            self.parser.get_method())
+        try:
+            for chunk in self.application(self.env, self.start_response):
+                self.response.write(chunk)
+            # log.debug('WROTE TO THE SERVER!')
+        except:
+            log.error(traceback.format_exception())
+        # log.debug('WROTE OUT!')
 
 
 def serve(
@@ -228,14 +185,15 @@ def serve(
         host=ServerDefaults.HOST, port=ServerDefaults.PORT,
         url_scheme=ServerDefaults.URL_SCHEME,
         server_protocol=ServerDefaults.SERVER_PROTOCOL):
-    loop = uvloop.new_event_loop()
-    asyncio.set_event_loop(loop)
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    loop = asyncio.get_event_loop()
+    loop.set_debug(True)
 
     server = loop.create_server(
         protocol_factory=functools.partial(
             WSGIHttpProtocol,
             loop=loop,
-            application=None,
+            application=application,
             base_env={
                 WSGIFields.SERVER_NAME: host,
                 WSGIFields.SERVER_PORT: port,

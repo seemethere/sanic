@@ -1,71 +1,53 @@
-class HttpResponse(object):
-    __slots__ = [
-        'header_bytes',
-        'headers_sent'
-    ]
+from .exceptions import ServerError
 
-    def __init__(self, status, transport):
+
+class HttpResponse(object):
+
+    def __init__(self, status, server_protocol, transport):
         self.headers = []
         self.status = status
-        self.content_type = b'type/plain'
+        self.server_protocol = server_protocol
         self.content_length = 0
+        self.bytes_remaining = 0
         self.headers_sent = False
         self.transport = transport
         self.bytes_remaining = 0
 
-    def header_bytes(
-            self,
-            server_protocol: bytes,
-            keep_alive: bool=False,
-            timeout: int=0):
+    def set_content_length(self, content_length):
+        # I know it's a setter, I know we're in python
+        self.content_length = content_length
+        self.bytes_remaining = content_length
+
+    @property
+    def header_bytes(self):
         header_bytes = b''
-        if keep_alive is True and timeout is not 0:
-            header_bytes += b'Keep-Alive: timeout=%d\r\n' % timeout
         for name, value in self.headers:
             # Headers should have already been encoded in start_response
             header_bytes += b'%b: %b\r\n' % (name, value)
         return (
             b'%b %b\r\n'
-            b'%b'
+            b'%b\r\n'
         ) % (
-            server_protocol,
+            self.server_protocol,
             self.status,
             header_bytes
         )
 
-    def write_headers(self, keep_alive: bool=False, timeout: int=0):
-        self.transport.write(self.header_bytes(keep_alive, timeout))
-        self.headers_sent = True
+    def write(self, chunk):
+        if not self.headers_sent:
+            self.transport.write(self.header_bytes)
+            self.headers_sent = True
 
+        chunk_length = len(chunk)
+        if (self.bytes_remaining is not None and
+                chunk_length > self.bytes_remaining):
+            raise ServerError(
+                'Application wanted more bytes than allocated for')
 
-    def to_html(
-            self,
-            body: bytes,
-            server_protocol: bytes,
-            keep_alive: bool=False,
-            timeout: int=0):
-        timeout_header = b''
-        if keep_alive is True and timeout is not 0:
-            timeout_header = b'Keep-Alive: timeout=%d\r\n' % timeout
-        headers = b''
-        if len(self.headers) != 0:
-            for name, value in self.headers:
-                # Headers should have already been encoded in start_response
-                headers += b'%b: %b\r\n' % (name, value)
-        return (
-            b'%b %b\r\n'
-            b'Content-Type: %b\r\n'
-            b'Content-Length: %d\r\n'
-            b'Connection: %b\r\n'
-            b'%b%b\r\n'
-            b'%b'
-        ) % (
-            server_protocol,
-            self.status,
-            self.content_type,
-            len(body),
-            b'keep-alive' if keep_alive else b'close',
-            timeout_header,
-            headers,
-            body
-        )
+        self.transport.write(chunk)
+
+        if self.bytes_remaining is not None:
+            self.bytes_remaining -= chunk_length
+            if self.bytes_remaining < 0:
+                raise ServerError(
+                    'Response body exceeds decalred Content-Length')
