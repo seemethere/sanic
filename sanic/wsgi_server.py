@@ -1,10 +1,11 @@
 import asyncio
+import cProfile
 import functools
+import io
 import os
 import signal
 import sys
 import traceback
-from io import BytesIO
 
 from httptools import HttpRequestParser, HttpParserError, parse_url
 import uvloop
@@ -15,14 +16,28 @@ from .wsgi_response import HttpResponse
 DEFAULT_ENCODING = 'ISO-8859-1'
 
 
+@functools.lru_cache()
 def bytes_to_native(byte_string, encoding=DEFAULT_ENCODING):
     return byte_string.decode(encoding)
+
+
+@functools.lru_cache()
+def native_to_bytes(native_string, encoding=DEFAULT_ENCODING):
+    return native_string.encode(encoding)
+
+
+def check_if_bytes(*objs):
+    try:
+        for obj in objs:
+            obj.decode
+    except AttributeError:
+        raise TypeError('Type must be bytes found: {}'.format(type(obj)))
 
 
 class ServerDefaults:
     HOST = '0.0.0.0'
     PORT = 8080
-    SERVER_PROTOCOL = 'HTTP/1.1'
+    SERVER_PROTOCOL = b'HTTP/1.1'
     MAX_REQUEST_SIZE = 100000
     URL_SCHEME = 'http'
     TIMEOUT = 60
@@ -66,7 +81,7 @@ class WSGIHttpProtocol(asyncio.Protocol):
         self.max_request_size = max_request_size
         self.parser = None
         self.timeout = timeout
-        self.env = self.fresh_env()
+        self.env = self.base_env.copy()
         # Empty response object at first
         self.response = None
         self.response_type = response_type
@@ -94,6 +109,7 @@ class WSGIHttpProtocol(asyncio.Protocol):
         # log.debug('Connection Made!')
         self.transport = transport
         self.register_connection(self)
+        # self.profile.enable()
 
     def connection_lost(self, exc):
         self.transport.close()
@@ -102,7 +118,8 @@ class WSGIHttpProtocol(asyncio.Protocol):
     # Data
     def data_received(self, data):
         self.current_request_size += len(data)
-        self.env[WSGIFields.INPUT] = BytesIO()
+        if not self.env.get(WSGIFields.INPUT):
+            self.env[WSGIFields.INPUT] = io.BytesIO()
         if self.current_request_size > self.max_request_size:
             # TODO: Write error handling for payload too large
             pass
@@ -125,45 +142,53 @@ class WSGIHttpProtocol(asyncio.Protocol):
             log.error(traceback.format_exc())
 
     def on_header(self, name, value):
-        translated_name = bytes_to_native(name).upper().replace("-", "_")
-        if name == b'Content-Length' and int(value) > self.max_request_size:
+        translated_name = bytes_to_native(
+            name,
+            encoding='latin1'
+        ).casefold().replace("-", "_")
+        if (translated_name == 'content_length' and
+                int(value) > self.max_request_size):
             ...
             # TODO: Handle Error, payload too large
-        if name in {b'Content-Length' or b'Content-Type'}:
-            self.env[translated_name] = bytes_to_native(value)
+        if translated_name in {'content_length' or 'content_type'}:
+            self.env[translated_name] = bytes_to_native(
+                value, encoding='latin1'
+            )
         else:
             self.env['HTTP_' + translated_name] = bytes_to_native(value)
 
     def on_headers_complete(self):
-        remote_addr = self.transport.get_extra_info('peername')
-        if remote_addr:
-            self.env['HTTP_REMOTE_ADDR'] = '%s:%s' % remote_addr
+        pass
+        # remote_addr = self.transport.get_extra_info('peername')
+        # if remote_addr:
+        #     self.env['HTTP_REMOTE_ADDR'] = '%s:%s' % remote_addr
 
     def on_body(self, body):
         self.env[WSGIFields.INPUT].write(body)
 
     def start_response(self, status, headers, exc_info=None):
         try:
-            self.response = HttpResponse(
-                status.encode(DEFAULT_ENCODING),
-                self.env[WSGIFields.SERVER_PROTOCOL].encode(DEFAULT_ENCODING),
-                self.transport)
+            status = native_to_bytes(status)
         except AttributeError:
-            raise TypeError('Status must be of type str')
+            pass
+
+        self.response = HttpResponse(
+            status,
+            self.env[WSGIFields.SERVER_PROTOCOL],
+            self.transport
+        )
+
         for key, value in headers:
             try:
-                encoded_key = key.encode(DEFAULT_ENCODING)
-                encoded_value = value.encode(DEFAULT_ENCODING)
+                key = native_to_bytes(key)
             except AttributeError:
-                # Handle places where the the key, value isn't a str
-                key, value = str(key), str(value)
-                encoded_key = key.encode(DEFAULT_ENCODING)
-                encoded_value = value.encode(DEFAULT_ENCODING)
-            except:
-                # TODO: Add unexpected error handling here
                 pass
-            self.response.headers.append((encoded_key, encoded_value))
-            if key.casefold() == 'content-length':
+            try:
+                value = native_to_bytes(value)
+            except AttributeError:
+                pass
+            self.response.headers.append((key, value))
+            if key.lower() == b'content-length':
                 self.response.set_content_length(int(value))
         return self.response.write
 
@@ -171,13 +196,17 @@ class WSGIHttpProtocol(asyncio.Protocol):
         self.env[WSGIFields.ERROR] = sys.stderr
         self.env[WSGIFields.REQUEST_METHOD] = bytes_to_native(
             self.parser.get_method())
+        self.env[WSGIFields.INPUT].seek(0)
         try:
+            # TODO: Figure out why POST requests aren't working
             for chunk in self.application(self.env, self.start_response):
                 self.response.write(chunk)
-            # log.debug('WROTE TO THE SERVER!')
-        except:
-            log.error(traceback.format_exception())
-        # log.debug('WROTE OUT!')
+        except Exception as e:
+            log.error(traceback.format_exc())
+        finally:
+            self.env[WSGIFields.INPUT] = io.BytesIO()
+            # self.profile.disable()
+            # self.profile.print_stats()
 
 
 def serve(
@@ -198,7 +227,8 @@ def serve(
                 WSGIFields.SERVER_NAME: host,
                 WSGIFields.SERVER_PORT: port,
                 WSGIFields.SERVER_PROTOCOL: server_protocol,
-                WSGIFields.URL_SCHEME: url_scheme
+                WSGIFields.URL_SCHEME: url_scheme,
+                **os.environ
             }
         ),
         host=host,
