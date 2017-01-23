@@ -1,5 +1,4 @@
 import asyncio
-import cProfile
 import functools
 import io
 import os
@@ -26,18 +25,10 @@ def native_to_bytes(native_string, encoding=DEFAULT_ENCODING):
     return native_string.encode(encoding)
 
 
-def check_if_bytes(*objs):
-    try:
-        for obj in objs:
-            obj.decode
-    except AttributeError:
-        raise TypeError('Type must be bytes found: {}'.format(type(obj)))
-
-
 class ServerDefaults:
     HOST = '0.0.0.0'
     PORT = 8080
-    SERVER_PROTOCOL = b'HTTP/1.1'
+    SERVER_PROTOCOL = 'HTTP/1.1'
     MAX_REQUEST_SIZE = 100000
     URL_SCHEME = 'http'
     TIMEOUT = 60
@@ -64,13 +55,25 @@ class WSGIFields:
 
 
 class WSGIHttpProtocol(asyncio.Protocol):
-    server_protocol_bytes = b''
+    __slots__ = [
+        'loop',
+        'application',
+        'base_env',
+        'port',
+        'current_request_size',
+        'max_request_size',
+        'parser',
+        'timeout',
+        'env',
+        'resposne',
+    ]
+    _server_protocol_bytes = None
     connections = set()
 
     def __init__(
             self, loop, application, base_env,
             max_request_size=ServerDefaults.MAX_REQUEST_SIZE,
-            response_type=HttpResponse, port=ServerDefaults.PORT,
+            port=ServerDefaults.PORT,
             timeout=ServerDefaults.TIMEOUT):
         self.loop = loop
         self.application = application
@@ -81,11 +84,9 @@ class WSGIHttpProtocol(asyncio.Protocol):
         self.max_request_size = max_request_size
         self.parser = None
         self.timeout = timeout
-        self.env = self.base_env.copy()
+        self.env = {}
         # Empty response object at first
         self.response = None
-        self.response_type = response_type
-        self.bytes_remaining = None
 
     @classmethod
     def register_connection(cls, connection):
@@ -95,21 +96,11 @@ class WSGIHttpProtocol(asyncio.Protocol):
     def deregister_connection(cls, connection):
         cls.connections.discard(connection)
 
-    def fresh_env(self):
-        """Returns a base environment to work with"""
-        return {
-            # Add environment variables
-            **os.environ,
-            # Add base environment variables
-            **self.base_env
-        }
-
     # Connections
     def connection_made(self, transport):
         # log.debug('Connection Made!')
         self.transport = transport
         self.register_connection(self)
-        # self.profile.enable()
 
     def connection_lost(self, exc):
         self.transport.close()
@@ -136,8 +127,9 @@ class WSGIHttpProtocol(asyncio.Protocol):
     def on_url(self, url):
         try:
             parsed_url = parse_url(url)
-            self.env[WSGIFields.PATH_INFO] = parsed_url.path.decode('latin1')
-            self.env[WSGIFields.QUERY_STRING] = parsed_url.query or ''
+            self.env[WSGIFields.PATH_INFO] = bytes_to_native(parsed_url.path)
+            self.env[WSGIFields.QUERY_STRING] = bytes_to_native(
+                parsed_url.query or b'')
         except:
             log.error(traceback.format_exc())
 
@@ -145,23 +137,16 @@ class WSGIHttpProtocol(asyncio.Protocol):
         translated_name = bytes_to_native(
             name,
             encoding='latin1'
-        ).casefold().replace("-", "_")
-        if (translated_name == 'content_length' and
-                int(value) > self.max_request_size):
-            ...
+        ).upper().replace("-", "_")
+        if translated_name == 'CONTENT_LENGTH':
+            if int(value) > self.max_request_size:
+                ...
             # TODO: Handle Error, payload too large
-        if translated_name in {'content_length' or 'content_type'}:
+        if translated_name in {'CONTENT_LENGTH' or 'CONTENT_TYPE'}:
             self.env[translated_name] = bytes_to_native(
-                value, encoding='latin1'
-            )
+                value, encoding='latin1')
         else:
             self.env['HTTP_' + translated_name] = bytes_to_native(value)
-
-    def on_headers_complete(self):
-        pass
-        # remote_addr = self.transport.get_extra_info('peername')
-        # if remote_addr:
-        #     self.env['HTTP_REMOTE_ADDR'] = '%s:%s' % remote_addr
 
     def on_body(self, body):
         self.env[WSGIFields.INPUT].write(body)
@@ -174,7 +159,7 @@ class WSGIHttpProtocol(asyncio.Protocol):
 
         self.response = HttpResponse(
             status,
-            self.env[WSGIFields.SERVER_PROTOCOL],
+            native_to_bytes(self.base_env[WSGIFields.SERVER_PROTOCOL]),
             self.transport
         )
 
@@ -197,6 +182,7 @@ class WSGIHttpProtocol(asyncio.Protocol):
         self.env[WSGIFields.REQUEST_METHOD] = bytes_to_native(
             self.parser.get_method())
         self.env[WSGIFields.INPUT].seek(0)
+        self.env.update(self.base_env)
         try:
             # TODO: Figure out why POST requests aren't working
             for chunk in self.application(self.env, self.start_response):
@@ -204,9 +190,10 @@ class WSGIHttpProtocol(asyncio.Protocol):
         except Exception as e:
             log.error(traceback.format_exc())
         finally:
-            self.env[WSGIFields.INPUT] = io.BytesIO()
-            # self.profile.disable()
-            # self.profile.print_stats()
+            self.current_request_size = 0
+            self.parser = None
+            self.response = None
+            self.env = {}
 
 
 def serve(
@@ -216,7 +203,7 @@ def serve(
         server_protocol=ServerDefaults.SERVER_PROTOCOL):
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     loop = asyncio.get_event_loop()
-    loop.set_debug(True)
+    # loop.set_debug(True)
 
     server = loop.create_server(
         protocol_factory=functools.partial(

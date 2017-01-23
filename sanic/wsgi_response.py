@@ -2,16 +2,25 @@ from .exceptions import ServerError
 
 
 class HttpResponse(object):
+    __slots__ = [
+        'headers',
+        'status',
+        'server_protocol',
+        'content_length',
+        'bytes_remaining',
+        'headers_sent',
+        'transport',
+        'bytes_remaining',
+    ]
 
     def __init__(self, status, server_protocol, transport):
         self.headers = []
         self.status = status
         self.server_protocol = server_protocol
         self.content_length = 0
-        self.bytes_remaining = 0
+        self.bytes_remaining = None
         self.headers_sent = False
         self.transport = transport
-        self.bytes_remaining = 0
 
     def set_content_length(self, content_length):
         # I know it's a setter, I know we're in python
