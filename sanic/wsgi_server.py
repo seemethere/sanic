@@ -222,11 +222,13 @@ def serve(
         port=port,
     )
 
-    log.info('Starting server')
+    log.info('Starting server @ {}:{} with pid {}'.format(
+        host, port, os.getpid()))
     loop.run_until_complete(server)
     loop.add_signal_handler(signal.SIGINT, loop.stop)
     loop.add_signal_handler(signal.SIGTERM, loop.stop)
     try:
         loop.run_forever()
     finally:
-        log.info('Exiting...')
+        log.info('Stopping server @ {}:{} with pid {}'.format(
+            host, port, os.getpid()))
