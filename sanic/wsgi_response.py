@@ -6,41 +6,30 @@ class HttpResponse(object):
         'headers',
         'status',
         'server_protocol',
-        'content_length',
         'bytes_remaining',
         'headers_sent',
         'transport',
         'bytes_remaining',
     ]
 
-    def __init__(self, status, server_protocol, transport):
-        self.headers = []
+    def __init__(self, headers, status, server_protocol, transport):
+        self.headers = headers
         self.status = status
         self.server_protocol = server_protocol
-        self.content_length = 0
         self.bytes_remaining = None
         self.headers_sent = False
         self.transport = transport
 
-    def set_content_length(self, content_length):
-        # I know it's a setter, I know we're in python
-        self.content_length = content_length
-        self.bytes_remaining = content_length
-
     @property
     def header_bytes(self):
-        header_bytes = b''
+        header_bytes = b'%b %b\r\n' % (self.server_protocol, self.status)
         for name, value in self.headers:
             # Headers should have already been encoded in start_response
             header_bytes += b'%b: %b\r\n' % (name, value)
-        return (
-            b'%b %b\r\n'
-            b'%b\r\n'
-        ) % (
-            self.server_protocol,
-            self.status,
-            header_bytes
-        )
+            if name == b'content-length':
+                self.bytes_remaining = int(value)
+        header_bytes += b'\r\n'
+        return header_bytes
 
     def write(self, chunk):
         if not self.headers_sent:
@@ -59,4 +48,5 @@ class HttpResponse(object):
             self.bytes_remaining -= chunk_length
             if self.bytes_remaining < 0:
                 raise ServerError(
-                    'Response body exceeds decalred Content-Length')
+                    'Response body exceeds declared Content-Length')
+
