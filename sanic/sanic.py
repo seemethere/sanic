@@ -1,3 +1,4 @@
+import traceback
 from asyncio import get_event_loop
 from collections import deque
 from functools import partial
@@ -10,11 +11,13 @@ import logging
 from .config import Config
 from .exceptions import Handler
 from .log import log
-from .response import HTTPResponse
+from .response import HTTPResponse, COMMON_STATUS_CODES, ALL_STATUS_CODES
 from .router import Router
 from .server import serve, HttpProtocol
 from .static import register as static_register
 from .exceptions import ServerError
+from .wsgi_server import WSGIFields
+from .wsgi_request import HTTPRequest as WSGIRequest
 from socket import socket, SOL_SOCKET, SO_REUSEADDR
 from os import set_inheritable
 
@@ -191,6 +194,30 @@ class Sanic:
 
     def converted_response_type(self, response):
         pass
+
+    async def wsgi_app(self, env, start_response):
+        try:
+            handler, args, kwargs = self.router._get(
+                env[WSGIFields.PATH_INFO],
+                env[WSGIFields.REQUEST_METHOD],
+                '')
+            request = WSGIRequest(env)
+            if handler is None:
+                raise ServerError(
+                    ("'None' was returned while requesting a "
+                        "handler from the router"))
+            # Run response handler
+            response = handler(request, *args, **kwargs)
+            if isawaitable(response):
+                response = await response
+            start_response(
+                b'%d %b' % (response.status,
+                            COMMON_STATUS_CODES.get(response.status)),
+                response.headers.items()
+            )
+            return [response.body]
+        except:
+            log.error(traceback.format_exc())
 
     async def handle_request(self, request, response_callback):
         """

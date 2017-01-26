@@ -1,11 +1,11 @@
 import asyncio
-import collections
 import functools
 import io
 import os
 import signal
 import sys
 import traceback
+from inspect import isawaitable
 
 from httptools import HttpRequestParser, HttpParserError, parse_url
 import uvloop
@@ -61,6 +61,7 @@ class WSGIFields:
     MULTITHREAD = 'wsgi.multithread'
     MULTIPROCESS = 'wsgi.multiprocess'
     RUN_ONCE = 'wsgi.run_once'
+    SANIC_LOOP = 'sanic.loop'
 
 
 class WSGIHttpProtocol(asyncio.Protocol):
@@ -147,7 +148,7 @@ class WSGIHttpProtocol(asyncio.Protocol):
 
     def on_header(self, name, value):
         try:
-            translated_name = bytes_to_str(name).replace("-", "_")
+            translated_name = bytes_to_str(name).replace("-", "_").upper()
             if name == b'Content-Length':
                 if int(value) > self.max_request_size:
                     ...
@@ -182,9 +183,7 @@ class WSGIHttpProtocol(asyncio.Protocol):
         except:
             log.error(traceback.format_exc())
 
-    def on_message_complete(self):
-        # self.profile.disable()
-        # self.profile.print_stats()
+    async def write_response(self):
         try:
             self.env[WSGIFields.ERROR] = sys.stderr
             self.env[WSGIFields.REQUEST_METHOD] = bytes_to_str(
@@ -192,7 +191,14 @@ class WSGIHttpProtocol(asyncio.Protocol):
             self.env[WSGIFields.INPUT] = io.BytesIO(self.request_body)
             self.env.update(self.base_env)
             try:
-                for chunk in self.application(self.env, self.start_response):
+                chunks = self.application(self.env, self.start_response)
+                import pudb; pu.db
+                if isawaitable(chunks):
+                    try:
+                        chunks = await chunks
+                    except StopIteration:
+                        pass
+                for chunk in chunks:
                     self.response.write(chunk)
             except:
                 log.error(traceback.format_exc())
@@ -204,6 +210,11 @@ class WSGIHttpProtocol(asyncio.Protocol):
         except:
             log.error(traceback.format_exc())
 
+    def on_message_complete(self):
+        # self.profile.disable()
+        # self.profile.print_stats()
+        self.loop.create_task(self.write_response())
+
 
 def serve(
         application,
@@ -211,7 +222,7 @@ def serve(
         url_scheme=ServerDefaults.URL_SCHEME,
         server_protocol=ServerDefaults.SERVER_PROTOCOL):
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    loop = asyncio.get_event_loop()
+    loop = uvloop.new_event_loop()
     # loop.set_debug(True)
 
     base_env = {
@@ -219,6 +230,7 @@ def serve(
         WSGIFields.SERVER_PORT: port,
         WSGIFields.SERVER_PROTOCOL: server_protocol,
         WSGIFields.URL_SCHEME: url_scheme,
+        WSGIFields.SANIC_LOOP: loop,
         **os.environ
     }
     protocol_factory = functools.partial(
