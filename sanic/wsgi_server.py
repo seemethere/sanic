@@ -16,7 +16,6 @@ from .wsgi_response import HttpResponse
 DEFAULT_ENCODING = 'utf-8'
 
 
-@functools.lru_cache()
 def bytes_to_str(byte_string, encoding=DEFAULT_ENCODING, lower=False):
     ret_str = byte_string
     if hasattr(byte_string, 'decode'):
@@ -26,7 +25,6 @@ def bytes_to_str(byte_string, encoding=DEFAULT_ENCODING, lower=False):
     return ret_str
 
 
-@functools.lru_cache()
 def str_to_bytes(native_string, encoding=DEFAULT_ENCODING, lower=False):
     ret_str = native_string
     if hasattr(native_string, 'encode'):
@@ -78,6 +76,7 @@ class WSGIHttpProtocol(asyncio.Protocol):
         'timeout',
         'env',
         'response',
+        'profile'
     ]
     connections = set()
 
@@ -127,7 +126,10 @@ class WSGIHttpProtocol(asyncio.Protocol):
             pass
         if self.parser is None:
             self.parser = HttpRequestParser(self)
-
+        # if not hasattr(self, 'profile'):
+        #     import cProfile
+        #     self.profile = cProfile.Profile()
+        #     self.profile.enable()
         try:
             self.parser.feed_data(data)
         except HttpParserError:
@@ -146,11 +148,12 @@ class WSGIHttpProtocol(asyncio.Protocol):
     def on_header(self, name, value):
         try:
             translated_name = bytes_to_str(name).replace("-", "_")
-            if name == b'Content_Length':
+            if name == b'Content-Length':
                 if int(value) > self.max_request_size:
                     ...
                     # TODO: Handle Error, payload too large
-            if translated_name in {b'Content_Length' or b'Content_Type'}:
+                self.env[translated_name] = bytes_to_str(value)
+            if name == b'Content-Type':
                 self.env[translated_name] = bytes_to_str(value)
             else:
                 self.env['HTTP_' + translated_name] = bytes_to_str(value)
@@ -163,11 +166,11 @@ class WSGIHttpProtocol(asyncio.Protocol):
         except:
             log.error(traceback.format_exc())
 
-
     def start_response(self, status, headers, exc_info=None):
         def convert_name_and_value(header):
             return (str_to_bytes(header[0], lower=True),
-                    str_to_bytes(header[1], lower=True))
+                    str_to_bytes(header[1]))
+
         try:
             self.response = HttpResponse(
                 map(convert_name_and_value, headers),
@@ -180,6 +183,8 @@ class WSGIHttpProtocol(asyncio.Protocol):
             log.error(traceback.format_exc())
 
     def on_message_complete(self):
+        # self.profile.disable()
+        # self.profile.print_stats()
         try:
             self.env[WSGIFields.ERROR] = sys.stderr
             self.env[WSGIFields.REQUEST_METHOD] = bytes_to_str(
