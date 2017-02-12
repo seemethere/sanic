@@ -293,7 +293,8 @@ class Sanic:
     def converted_response_type(self, response):
         pass
 
-    async def handle_request(self, request, response_callback):
+    async def handle_request(
+            self, request, response_callback, previous_response_sent):
         """
         Takes a request from the HTTP Server and returns a response object to
         be sent back The HTTP Server only expects a response object, so
@@ -367,7 +368,8 @@ class Sanic:
                 else:
                     response = HTTPResponse(
                         "An error occurred while handling an error")
-
+        if previous_response_sent is not None:
+            await previous_response_sent.wait()
         response_callback(response)
 
     # -------------------------------------------------------------------- #

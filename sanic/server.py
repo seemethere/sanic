@@ -61,7 +61,8 @@ class HttpProtocol(asyncio.Protocol):
         # request config
         'request_handler', 'request_timeout', 'request_max_size',
         # connection management
-        '_total_request_size', '_timeout_handler', '_last_communication_time')
+        '_total_request_size', '_timeout_handler', '_last_communication_time',
+        'previous_response_event')
 
     def __init__(self, *, loop, request_handler, error_handler,
                  signal=Signal(), connections=set(), request_timeout=60,
@@ -82,6 +83,7 @@ class HttpProtocol(asyncio.Protocol):
         self._timeout_handler = None
         self._last_request_time = None
         self._request_handler_task = None
+        self.previous_response_event = None
 
     # -------------------------------------------- #
     # Connection
@@ -152,7 +154,8 @@ class HttpProtocol(asyncio.Protocol):
             headers=CIDict(self.headers),
             version=self.parser.get_http_version(),
             method=self.parser.get_method().decode(),
-            transport=self.transport
+            transport=self.transport,
+            keep_alive=self.parser.should_keep_alive()
         )
 
     def on_body(self, body):
@@ -161,52 +164,61 @@ class HttpProtocol(asyncio.Protocol):
     def on_message_complete(self):
         if self.request.body:
             self.request.body = b''.join(self.request.body)
+        event = asyncio.Event()
         self._request_handler_task = self.loop.create_task(
-            self.request_handler(self.request, self.write_response))
+            self.request_handler(
+                self.request,
+                partial(self.write_response, request=self.request,
+                        response_written=event),
+                self.previous_response_event
+            )
+        )
+        self.previous_response_event = event
+        self.cleanup()
 
     # -------------------------------------------- #
     # Responding
     # -------------------------------------------- #
 
-    def write_response(self, response):
+    def write_response(self, response, request, response_written):
+        keep_alive = request.keep_alive and not self.signal.stopped
         try:
-            keep_alive = (
-                self.parser.should_keep_alive() and not self.signal.stopped)
             self.transport.write(
                 response.output(
-                    self.request.version, keep_alive, self.request_timeout))
+                    request.version, keep_alive, self.request_timeout))
         except RuntimeError:
             log.error(
                 'Connection lost before response written @ {}'.format(
-                    self.request.ip))
+                    request.ip))
         except Exception as e:
             self.bail_out(
-                "Writing response failed, connection closed {}".format(e))
+                "Writing response failed, connection closed {}".format(e),
+                request)
         finally:
             if not keep_alive:
                 self.transport.close()
             else:
                 # Record that we received data
                 self._last_request_time = current_time
-                self.cleanup()
+            response_written.set()
 
-    def write_error(self, exception):
+    def write_error(self, exception, request):
         try:
-            response = self.error_handler.response(self.request, exception)
-            version = self.request.version if self.request else '1.1'
+            response = self.error_handler.response(request, exception)
+            version = request.version if request else '1.1'
             self.transport.write(response.output(version))
         except RuntimeError:
             log.error(
                 'Connection lost before error written @ {}'.format(
-                    self.request.ip))
+                    request.ip))
         except Exception as e:
             self.bail_out(
                 "Writing error failed, connection closed {}".format(e),
-                from_error=True)
+                request, from_error=True)
         finally:
             self.transport.close()
 
-    def bail_out(self, message, from_error=False):
+    def bail_out(self, message, request, from_error=False):
         if from_error and self.transport.is_closing():
             log.error(
                 ("Transport closed @ {} and exception "
@@ -216,14 +228,14 @@ class HttpProtocol(asyncio.Protocol):
                 'Exception:\n{}'.format(traceback.format_exc()))
         else:
             exception = ServerError(message)
-            self.write_error(exception)
+            self.write_error(exception, request)
             log.error(message)
 
     def cleanup(self):
         self.parser = None
         self.request = None
         self.url = None
-        self.headers = None
+        self.headers = []
         self._request_handler_task = None
         self._total_request_size = 0
 

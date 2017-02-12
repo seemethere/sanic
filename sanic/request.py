@@ -38,10 +38,13 @@ class Request(dict):
         'url', 'headers', 'version', 'method', '_cookies', 'transport',
         'query_string', 'body',
         'parsed_json', 'parsed_args', 'parsed_form', 'parsed_files',
+        'keep_alive',
         '_ip',
     )
 
-    def __init__(self, url_bytes, headers, version, method, transport):
+    def __init__(
+            self, url_bytes, headers, version, method, transport,
+            keep_alive):
         # TODO: Content-Encoding detection
         url_parsed = parse_url(url_bytes)
         self.url = url_parsed.path.decode('utf-8')
@@ -59,6 +62,7 @@ class Request(dict):
         self.parsed_form = None
         self.parsed_files = None
         self.parsed_args = None
+        self.keep_alive = keep_alive
         self._cookies = None
 
     @property
